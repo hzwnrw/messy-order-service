@@ -1,36 +1,34 @@
 package com.example.orderservice.service;
 
-import com.example.orderservice.dto.OrderDetailResponse;
-import com.example.orderservice.dto.OrderItemRequest;
-import com.example.orderservice.dto.OrderRequest;
-import com.example.orderservice.dto.OrderResponse;
+import com.example.orderservice.config.ProductServiceConfig;
+import com.example.orderservice.config.ShippingConfig;
+import com.example.orderservice.dto.*;
 import com.example.orderservice.model.Order;
 import com.example.orderservice.repository.OrderRepository;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestTemplate;
 
 import java.util.*;
+import java.util.stream.Collectors;
 
 @Service
 public class OrderService {
 
-    @Value("${product.service.url}")
-    private String productServiceUrl;
-
-    @Value("${product.service.path}")
-    private String productPath;
-
-    @Value("${shipping.free.threshold}")
-    private double freeShippingThreshold;
-
-    @Value("${shipping.cost}")
-    private double shippingCost;
-
+    private final ProductServiceConfig productConfig;
+    private final ShippingConfig shippingConfig;
     private final OrderRepository or;
     private final RestTemplate rt;
 
-    public OrderService(OrderRepository or, RestTemplate rt) {
+    public OrderService(
+            ProductServiceConfig productConfig,
+            ShippingConfig shippingConfig,
+            OrderRepository or,
+            RestTemplate rt
+    ) {
+        this.productConfig = productConfig;
+        this.shippingConfig = shippingConfig;
         this.or = or;
         this.rt = rt;
     }
@@ -54,53 +52,67 @@ public class OrderService {
 
     public OrderResponse makeOrder(OrderRequest request) {
 
+        if (request == null || request.getItems() == null || request.getItems().isEmpty()) {
+            throw new IllegalArgumentException("Order must contain at least one item");
+        }
+
         String customerType = request.getCustomerType();
         double discount = DISCOUNT_MAP.getOrDefault(customerType, 0.0);
 
-        Set<Long> productIds = new HashSet<>();
-        for (OrderItemRequest item : request.getItems()) {
-            productIds.add(item.getProductId());
-        }
+        Set<Long> productIds = request.getItems().stream()
+                .map(OrderItemRequest::getProductId)
+                .collect(Collectors.toSet());
 
-        Map<Long, Map<String, Object>> productCache = new HashMap<>();
+        Map<Long, ProductResponse> productCache = new HashMap<>();
 
         for (Long productId : productIds) {
-            String url = productServiceUrl + productPath;
-            Map<String, Object> product = rt.getForObject(url, Map.class);
+            String url = productConfig.getUrl() + productConfig.getPath() + "/{id}";
 
-            if (product == null) {
+            try {
+                ProductResponse product = rt.getForObject(url, ProductResponse.class, productId);
+
+                if (product == null) {
+                    throw new IllegalArgumentException("Product not found: " + productId);
+                }
+
+                productCache.put(productId, product);
+
+            } catch (HttpClientErrorException.NotFound e) {
                 throw new IllegalArgumentException("Product not found: " + productId);
+            } catch (RestClientException e) {
+                throw new IllegalStateException(
+                        "Product service unavailable for product: " + productId, e);
             }
-
-            productCache.put(productId, product);
         }
 
-        double total = 0;
+        double total = 0.0;
 
         for (OrderItemRequest item : request.getItems()) {
 
-            Map<String, Object> product = productCache.get(item.getProductId());
+            if (item.getQuantity() <= 0) {
+                throw new IllegalArgumentException(
+                        "Invalid quantity for product: " + item.getProductId());
+            }
 
-            double price = Double.parseDouble(product.get("price").toString());
-            int stock = Integer.parseInt(product.get("stock").toString());
+            ProductResponse product = productCache.get(item.getProductId());
 
-            if (stock <= 0) {
+            if (product.getStock() <= 0) {
                 throw new IllegalArgumentException(
                         "Product out of stock: " + item.getProductId());
             }
 
-            if (item.getQuantity() > stock) {
+            if (item.getQuantity() > product.getStock()) {
                 throw new IllegalArgumentException(
                         "Not enough stock for product: " + item.getProductId());
             }
 
-            total += price * item.getQuantity();
+            total += product.getPrice() * item.getQuantity();
         }
 
         double finalTotal = total - (total * discount);
 
-        if (finalTotal > freeShippingThreshold) {
-            finalTotal -= shippingCost;
+        if (finalTotal < shippingConfig.getFreeThreshold()) {
+            finalTotal += shippingConfig.getCost();
         }
 
         Order order = new Order();
@@ -121,13 +133,12 @@ public class OrderService {
         Order order = or.findById(id)
                 .orElseThrow(() -> new NoSuchElementException("Order not found"));
 
-        String status = order.getStatus();
         String message = STATUS_MESSAGE_MAP.getOrDefault(
-                status, "Unknown status");
+                order.getStatus(), "Unknown status");
 
         return new OrderDetailResponse(
                 order.getId(),
-                status,
+                order.getStatus(),
                 message,
                 order.getTotal()
         );
